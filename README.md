@@ -12,8 +12,8 @@ To run this bot yourself, follow these steps:
 1️⃣ **Clone the repository**
 
 ```bash
-git clone <repository_url>
-cd <repository_directory>
+git clone https://github.com/krutoychel24/chat-tgbot.git
+cd chat-tgbot
 ```
 
 ---
