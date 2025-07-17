@@ -29,6 +29,7 @@ EVENT_CHANCE = 20
 SPAM_COOLDOWN_SECONDS = 2
 DUEL_ACCEPT_TIMEOUT_SECONDS = 60
 PRESTIGE_REQUIREMENT = 100
+BLACKJACK_TURN_SECONDS = 30
 
 # --- Localization Strings ---
 LANGUAGES = {
@@ -52,7 +53,7 @@ LANGUAGES = {
         'nickname_prompt': "Чтобы дать имя, напиши команду так: /nickname [новое имя]",
         'me_title': "👤 <b>Твой профиль:</b>",
         'me_name': "Имя вомбата: <b>{nickname}</b>",
-        'me_medals': "Медали престижа: {medals} �",
+        'me_medals': "Медали престижа: {medals} 🏅",
         'me_size': "Текущий размер: {size} см",
         'me_rank': "Место в топе: {rank} из {total}",
         'me_status_condemned': "Статус: <b>ОСУЖДЕН</b> 😡",
@@ -86,6 +87,7 @@ LANGUAGES = {
         'bj_res_loss': "Проигрыш. (-{bet} см)",
         'bj_res_push': "Ничья.",
         'unknown_player': "Неизвестный игрок",
+        'bj_turn_timeout': "{name} не успел сделать ход и автоматически выбрал 'пас'.",
     },
     'en': {
         'start_new': "Hello, {first_name}! 👋\nYour wombat has grown by {initial_growth} cm right away!\n<b>Current size: {initial_growth} cm.</b>\nType /help to see the command list.",
@@ -99,7 +101,7 @@ LANGUAGES = {
         'prestige_success': "🏅 <b>PRESTIGE!</b> 🏅\n\nCongratulations, you reached {req} cm and reset your growth for a medal!\nYour size is now: <b>{new_size} cm</b>.\nTotal medals: <b>{medals}</b>.",
         'prestige_fail': "To reset and get a medal, you need to reach {req} cm.\nYou need {needed} more cm.",
         'top_no_players': "No one is playing in this chat yet.",
-        'top_caption': "Here is the current rating 🏆",
+        'top_caption': "Here is the current rating �",
         'top_title': "Top Wombats of this Chat",
         'top_xlabel': "Size (cm)",
         'nickname_too_long': "Nickname is too long!",
@@ -141,6 +143,7 @@ LANGUAGES = {
         'bj_res_loss': "Loss. (-{bet} cm)",
         'bj_res_push': "Push.",
         'unknown_player': "Unknown Player",
+        'bj_turn_timeout': "{name} ran out of time and automatically stood.",
     }
 }
 
@@ -705,7 +708,8 @@ async def command_blackjack_handler(message: types.Message, command: CommandObje
         "message_id": None,
         "current_player_index": 0,
         "end_time": join_end_time.isoformat(),
-        "expecting_bet_from": None
+        "expecting_bet_from": None,
+        "turn_end_time": None,
     }
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -817,6 +821,7 @@ async def start_blackjack_game_logic(chat_id: int):
 
     await asyncio.sleep(2)
     
+    game['turn_end_time'] = (datetime.now() + timedelta(seconds=BLACKJACK_TURN_SECONDS)).isoformat()
     save_blackjack_game(chat_id, game)
     await update_blackjack_message(chat_id)
 
@@ -894,9 +899,11 @@ async def process_next_player_turn(chat_id):
             break 
 
     if game['current_player_index'] >= len(player_ids):
+        game['turn_end_time'] = None
         save_blackjack_game(chat_id, game)
         await dealer_turn(chat_id)
     else:
+        game['turn_end_time'] = (datetime.now() + timedelta(seconds=BLACKJACK_TURN_SECONDS)).isoformat()
         save_blackjack_game(chat_id, game)
         await update_blackjack_message(chat_id)
 
@@ -1067,6 +1074,8 @@ async def process_blackjack_callback(callback: types.CallbackQuery):
 
     action = callback.data.split("_")[1]
     logging.info(f"[BJ_ACTION] Chat {chat_id}: Player {user_id} chose to {action}.")
+    
+    game['turn_end_time'] = None # Stop the timer
 
     if action == "hit":
         game['players'][str(user_id)]['hand'].append(game['deck'].pop())
@@ -1078,6 +1087,7 @@ async def process_blackjack_callback(callback: types.CallbackQuery):
             await asyncio.sleep(1)
             await process_next_player_turn(chat_id)
         else:
+            game['turn_end_time'] = (datetime.now() + timedelta(seconds=BLACKJACK_TURN_SECONDS)).isoformat()
             save_blackjack_game(chat_id, game)
             await update_blackjack_message(chat_id)
 
@@ -1183,6 +1193,7 @@ async def background_tasks():
             all_chats = db_query("SELECT * FROM chats", fetchall=True)
             for chat in all_chats:
                 chat_id = chat['chat_id']
+                lang = get_lang(chat_id)
                 try:
                     if chat['active_duel_json']:
                         duel = json.loads(chat['active_duel_json'])
@@ -1196,16 +1207,30 @@ async def background_tasks():
 
                     if chat['active_blackjack_json']:
                         game = get_blackjack_game(chat_id)
-                        if game and game.get('state') == 'waiting':
-                            end_time = datetime.fromisoformat(game["end_time"])
-                            logging.info(f"[BJ_TIMER] Chat {chat_id}: Checking timer. Now={now}, End={end_time}. Time left: {(end_time - now).total_seconds():.1f}s")
-                            if now > end_time:
-                                logging.info(f"[BJ_TIMER_EXPIRED] Chat {chat_id}: Timer expired. Forcing game start.")
-                                if game.get('expecting_bet_from') is not None:
-                                    logging.warning(f"[BJ_BET_TIMEOUT] Chat {chat_id}: User {game['expecting_bet_from']} did not bet in time.")
-                                    game['expecting_bet_from'] = None
-                                    save_blackjack_game(chat_id, game)
-                                await start_blackjack_game_logic(chat_id)
+                        if game and game.get('state') == 'waiting' and now > datetime.fromisoformat(game["end_time"]):
+                            logging.info(f"[BJ_TIMER_EXPIRED] Chat {chat_id}: Lobby timer expired. Forcing game start.")
+                            if game.get('expecting_bet_from') is not None:
+                                logging.warning(f"[BJ_BET_TIMEOUT] Chat {chat_id}: User {game['expecting_bet_from']} did not bet in time.")
+                                game['expecting_bet_from'] = None
+                                save_blackjack_game(chat_id, game)
+                            await start_blackjack_game_logic(chat_id)
+                        
+                        if game and game.get('state') == 'in_progress' and game.get('turn_end_time'):
+                            if now > datetime.fromisoformat(game['turn_end_time']):
+                                player_ids = list(game['players'].keys())
+                                current_player_id_str = player_ids[game['current_player_index']]
+                                current_player_name = await get_player_name(int(current_player_id_str), chat_id)
+                                
+                                logging.warning(f"[BJ_TURN_TIMEOUT] Chat {chat_id}: Player {current_player_id_str} timed out.")
+                                
+                                game['players'][current_player_id_str]['status'] = 'stood'
+                                game['current_player_index'] += 1
+                                game['turn_end_time'] = None
+                                save_blackjack_game(chat_id, game)
+                                
+                                await bot.send_message(chat_id, t('bj_turn_timeout', lang, name=current_player_name))
+                                await process_next_player_turn(chat_id)
+
 
                     if chat['active_trial_json']:
                         trial = json.loads(chat['active_trial_json'])
